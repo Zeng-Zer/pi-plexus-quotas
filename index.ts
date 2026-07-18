@@ -177,23 +177,33 @@ function lineFromPayload(payload: QuotaChecker[]): string {
 
 function renderWidget(): void {
   const ctx = currentCtx;
-  if (!ctx?.hasUI) return;
+  if (!ctx) return;
 
-  if (!lastLine) {
-    ctx.ui.setWidget("plexus-quotas", undefined);
+  try {
+    if (!ctx.hasUI) return;
+  } catch {
     return;
   }
 
-  ctx.ui.setWidget(
-    "plexus-quotas",
-    (_tui, theme) => ({
-      render(width: number) {
-        return [truncateToWidth(theme.fg("dim", lastLine!), width, theme.fg("dim", "..."))];
-      },
-      invalidate() {},
-    }),
-    { placement: "belowEditor" },
-  );
+  if (!lastLine) {
+    try {
+      ctx.ui.setWidget("plexus-quotas", undefined);
+    } catch {}
+    return;
+  }
+
+  try {
+    ctx.ui.setWidget(
+      "plexus-quotas",
+      (_tui, theme) => ({
+        render(width: number) {
+          return [truncateToWidth(theme.fg("dim", lastLine!), width, theme.fg("dim", "..."))];
+        },
+        invalidate() {},
+      }),
+      { placement: "belowEditor" },
+    );
+  } catch {}
 }
 
 async function doRefresh(): Promise<void> {
@@ -253,7 +263,9 @@ export default function plexusQuotas(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     if (timer) clearInterval(timer);
     timer = undefined;
-    currentCtx?.ui.setWidget("plexus-quotas", undefined);
+    try {
+      currentCtx?.ui.setWidget("plexus-quotas", undefined);
+    } catch {}
     currentCtx = undefined;
   });
 
