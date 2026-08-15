@@ -62,3 +62,32 @@ assert.equal(
   ]),
   "openai: 5h 12% / 7d 33%",
 );
+
+assert.equal(
+  lineFromPayload(
+    [
+      {
+        checkerId: "cursor",
+        provider: "cursor",
+        meters: [
+          {
+            key: "cursor_models",
+            used: 0.0567,
+            limit: 100,
+            unit: "percentage",
+            resetsAt: "2026-09-11T15:34:46.000Z",
+          },
+          {
+            key: "other_models",
+            used: 0.0444,
+            limit: 100,
+            unit: "percentage",
+            resetsAt: "2026-09-11T15:34:46.000Z",
+          },
+        ],
+      },
+    ],
+    now,
+  ),
+  "cursor: models 0.1% / other 0.1% · (26d)",
+);

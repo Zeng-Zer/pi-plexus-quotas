@@ -53,7 +53,12 @@ function formatValue(value: unknown, meter: QuotaMeter): string | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
 
   const unit = meter.unit?.toLowerCase() ?? "";
-  const decimals = unit === "usd" || unit === "$" || (Math.abs(value) < 10 && unit !== "%" && unit !== "percentage") ? 2 : 0;
+  if ((unit === "%" || unit === "percentage") && value > 0 && value < 0.1) return "0.1%";
+  const decimals = unit === "%" || unit === "percentage"
+    ? 1
+    : unit === "usd" || unit === "$" || Math.abs(value) < 10
+      ? 2
+      : 0;
   const formatted = formatNumber(value, decimals);
 
   if (unit === "$" || unit === "usd") return `$${formatted}`;
@@ -62,6 +67,11 @@ function formatValue(value: unknown, meter: QuotaMeter): string | undefined {
 }
 
 function formatMeterValue(meter: QuotaMeter): string {
+  const unit = meter.unit?.toLowerCase();
+  if (unit === "%" || unit === "percentage") {
+    return formatValue(meter.used ?? meter.utilizationPercent, meter) ?? "?";
+  }
+
   const used = formatValue(meter.used, meter);
   const limit = formatValue(meter.limit, meter);
   if (used && limit) return `${used}/${limit}`;
@@ -96,6 +106,8 @@ function periodLabel(meter: QuotaMeter): string | undefined {
 }
 
 function compactMeterLabel(meter: QuotaMeter): string {
+  if (meter.key === "cursor_models") return "models";
+  if (meter.key === "other_models") return "other";
   return (meter.key ?? meter.label ?? "?")
     .replace(/_(?:quota|limit|usage|spend|balance)$/i, "")
     .replace(/[_-]+/g, " ");
@@ -124,12 +136,16 @@ export function lineFromPayload(payload: QuotaChecker[], now = Date.now()): stri
       const meters = checker.meters ?? checker.latest ?? [];
       const showLabels = meters.length > 1;
       const labels = showLabels ? meterLabels(meters) : [];
+      const sharedReset =
+        showLabels && meters.every((meter) => meter.resetsAt === meters[0]?.resetsAt)
+          ? formatReset(meters[0]?.resetsAt, now)
+          : undefined;
       const values = meters.map((meter, index) => {
         const prefix = showLabels ? `${labels[index]} ` : "";
-        const reset = formatReset(meter.resetsAt, now);
+        const reset = sharedReset ? undefined : formatReset(meter.resetsAt, now);
         return `${prefix}${formatMeterValue(meter)}${reset ? ` · ${reset}` : ""}`;
       });
-      return `${label}: ${values.length ? values.join(" / ") : "ok"}`;
+      return `${label}: ${values.length ? values.join(" / ") : "ok"}${sharedReset ? ` · ${sharedReset}` : ""}`;
     })
     .join(" | ");
 }
