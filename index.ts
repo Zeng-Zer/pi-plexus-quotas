@@ -4,29 +4,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-type MeterFormat = "used_percent" | "remaining_percent" | "used_limit" | "remaining_limit" | "used_remaining";
-
-type MeterRule = {
-  key?: string;
-  label?: string;
-  match?: string;
-  format?: MeterFormat;
-  unit?: string;
-  decimals?: number;
-};
-
-type CheckerRule = {
-  checkerId: string;
-  label?: string;
-  meterSeparator?: string;
-  meters?: MeterRule[];
-};
-
 type Config = {
-  baseUrl: string;
   adminKey: string;
   pollMs?: number;
-  checkers: CheckerRule[];
 };
 
 type QuotaMeter = {
@@ -37,19 +17,25 @@ type QuotaMeter = {
   remaining?: number;
   utilizationPercent?: number;
   unit?: string;
+  kind?: "balance" | "allowance";
+  periodValue?: number;
+  periodUnit?: "minute" | "hour" | "day" | "week" | "month";
+  resetsAt?: string;
 };
 
 type QuotaChecker = {
   checkerId?: string;
+  checkerType?: string;
+  provider?: string;
   success?: boolean;
   latest?: QuotaMeter[];
   meters?: QuotaMeter[];
 };
 
-
+const PLEXUS_PROVIDER = "plexus";
 const CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "config.json");
 
-let config: Config = loadConfig();
+let config: Config = { adminKey: "" };
 let currentCtx: ExtensionContext | undefined;
 let timer: NodeJS.Timeout | undefined;
 let lastLine: string | undefined;
@@ -63,11 +49,11 @@ function formatNumber(value: number, decimals = 0): string {
   return value.toFixed(decimals).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
 }
 
-function formatValue(value: unknown, meter: QuotaMeter, rule: MeterRule): string | undefined {
+function formatValue(value: unknown, meter: QuotaMeter): string | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
 
-  const unit = rule.unit ?? meter.unit ?? "";
-  const decimals = rule.decimals ?? (Math.abs(value) < 10 && unit !== "%" ? 2 : 0);
+  const unit = meter.unit?.toLowerCase() ?? "";
+  const decimals = unit === "usd" || unit === "$" || (Math.abs(value) < 10 && unit !== "%" && unit !== "percentage") ? 2 : 0;
   const formatted = formatNumber(value, decimals);
 
   if (unit === "$" || unit === "usd") return `$${formatted}`;
@@ -75,102 +61,75 @@ function formatValue(value: unknown, meter: QuotaMeter, rule: MeterRule): string
   return unit ? `${formatted}${unit}` : formatted;
 }
 
-
-function findMeter(checker: QuotaChecker, rule: MeterRule): QuotaMeter | undefined {
-  const meters = checker.meters ?? checker.latest ?? [];
-  if (rule.key) {
-    const byKey = meters.find((meter) => meter.key === rule.key);
-    if (byKey) return byKey;
+function formatMeterValue(meter: QuotaMeter): string {
+  const used = formatValue(meter.used, meter);
+  const limit = formatValue(meter.limit, meter);
+  if (used && limit) return `${used}/${limit}`;
+  if (used) return used;
+  if (meter.kind === "allowance" && typeof meter.utilizationPercent === "number") {
+    return formatValue(meter.utilizationPercent, { unit: "percentage" }) ?? "?";
   }
-  if (rule.match) {
-    const re = new RegExp(rule.match, "i");
-    return meters.find((meter) => re.test(meter.key ?? "") || re.test(meter.label ?? ""));
+  return formatValue(meter.remaining, meter) ?? "?";
+}
+
+function formatReset(resetsAt: string | undefined, now: number): string | undefined {
+  if (!resetsAt) return undefined;
+  const remainingMs = Date.parse(resetsAt) - now;
+  if (!Number.isFinite(remainingMs)) return undefined;
+  if (remainingMs <= 0) return "(now)";
+
+  const minutes = Math.max(1, Math.floor(remainingMs / 60_000));
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days >= 7) return `(${days}d)`;
+  if (days > 0) return `(${days}d${hours % 24 ? ` ${hours % 24}h` : ""})`;
+  if (hours > 0) return `(${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ""})`;
+  return `(${minutes}m)`;
+}
+
+function periodLabel(meter: QuotaMeter): string | undefined {
+  if (meter.periodValue && meter.periodUnit) {
+    const suffix = { minute: "m", hour: "h", day: "d", week: "w", month: "mo" }[meter.periodUnit];
+    return `${meter.periodValue}${suffix}`;
   }
   return undefined;
 }
 
-function formatMeter(meter: QuotaMeter | undefined, rule: MeterRule): string {
-  if (!meter) return "?";
+function compactMeterLabel(meter: QuotaMeter): string {
+  return (meter.key ?? meter.label ?? "?")
+    .replace(/_(?:quota|limit|usage|spend|balance)$/i, "")
+    .replace(/[_-]+/g, " ");
+}
 
-  switch (rule.format ?? "used_percent") {
-    case "remaining_percent":
-      return formatValue(meter.remaining, { ...meter, unit: "%" }, rule) ?? "?";
-    case "used_limit": {
-      const used = formatValue(meter.used, meter, rule) ?? "?";
-      const limit = formatValue(meter.limit, meter, rule) ?? "?";
-      return `${used}/${limit}`;
-    }
-    case "remaining_limit": {
-      const remaining = formatValue(meter.remaining, meter, rule) ?? "?";
-      const limit = formatValue(meter.limit, meter, rule) ?? "?";
-      return `${remaining}/${limit}`;
-    }
-    case "used_remaining": {
-      const used = formatValue(meter.used, meter, rule) ?? "?";
-      const remaining = formatValue(meter.remaining, meter, rule) ?? "?";
-      return `${used}/${remaining}`;
-    }
-    case "used_percent":
-    default:
-      return formatValue(meter.used, { ...meter, unit: "%" }, rule) ?? "?";
+function meterLabels(meters: QuotaMeter[]): string[] {
+  const periods = meters.map(periodLabel);
+  if (periods.every((period): period is string => period !== undefined) && new Set(periods).size === periods.length) {
+    return periods;
   }
+  return meters.map(compactMeterLabel);
 }
 
-function autoRulesForChecker(checker: QuotaChecker): CheckerRule {
-  const meters = checker.meters ?? checker.latest ?? [];
-  const label = (checker as Record<string, unknown>).checkerType as string | undefined ?? checker.checkerId ?? "?";
-  // When all meters share the same unit, suppress per-meter unit to avoid repetition
-  const sharedUnit = meters.length > 1 && meters.every((m) => m.unit && m.unit === meters[0].unit);
-  return {
-    checkerId: checker.checkerId ?? "",
-    label,
-    meters: meters.map((m) => ({
-      key: m.key,
-      label: m.key,
-      format: "used_limit" as MeterFormat,
-      unit: sharedUnit ? "" : undefined,
-    })),
-    meterSeparator: sharedUnit ? undefined : " / ",
-  };
+function checkerLabel(checker: QuotaChecker): string {
+  return checker.provider && checker.provider !== "upstream"
+    ? checker.provider
+    : checker.checkerType ?? checker.checkerId ?? "?";
 }
 
-function lineFromPayload(payload: QuotaChecker[]): string {
-  const byId = new Map(payload.map((checker) => [checker.checkerId, checker]));
-  const configured = new Set(config.checkers.map((r) => r.checkerId));
+export function lineFromPayload(payload: QuotaChecker[], now = Date.now()): string {
+  return payload
+    .map((checker) => {
+      const label = checkerLabel(checker);
+      if (checker.success === false) return `${label}: ?`;
 
-  // Configured checkers first (with their formatting rules), then any unconfigured ones (auto-discovered)
-  const allRules = [
-    ...config.checkers,
-    ...payload
-      .filter((c) => !configured.has(c.checkerId))
-      .map((c) => autoRulesForChecker(c)),
-  ];
-
-  return allRules
-    .map((rule) => {
-      const checker = byId.get(rule.checkerId);
-      const label = rule.label ?? rule.checkerId;
-      if (!checker || checker.success === false) return `${label}: ?`;
-
-      const checkerMeters = checker.meters ?? checker.latest ?? [];
-      const meterParts = (rule.meters ?? []).map((meterRule) => {
-        const value = formatMeter(findMeter(checker, meterRule), meterRule);
-        return meterRule.label ? `${meterRule.label} ${value}` : value;
+      const meters = checker.meters ?? checker.latest ?? [];
+      const showLabels = meters.length > 1;
+      const labels = showLabels ? meterLabels(meters) : [];
+      const values = meters.map((meter, index) => {
+        const prefix = showLabels ? `${labels[index]} ` : "";
+        const reset = formatReset(meter.resetsAt, now);
+        return `${prefix}${formatMeterValue(meter)}${reset ? ` · ${reset}` : ""}`;
       });
-
-      // If all meters share the same unit and it was suppressed per-meter (auto-discovered only), append it once
-      const isAutoDiscovered = !configured.has(rule.checkerId);
-      const renderedMeters = (rule.meters ?? [])
-        .map((mr) => findMeter(checker, mr))
-        .filter((m): m is QuotaMeter => m !== undefined);
-      const sharedUnit =
-        isAutoDiscovered &&
-        renderedMeters.length > 1 && renderedMeters.every((m) => m.unit && m.unit === renderedMeters[0].unit)
-          ? renderedMeters[0].unit
-          : undefined;
-      const unitSuffix = sharedUnit && sharedUnit !== "%" ? ` ${sharedUnit}` : "";
-
-      return `${label}: ${meterParts.length > 0 ? meterParts.join(rule.meterSeparator ?? " / ") + unitSuffix : "ok"}`;
+      return `${label}: ${values.length ? values.join(" / ") : "ok"}`;
     })
     .join(" | ");
 }
@@ -206,20 +165,30 @@ function renderWidget(): void {
   } catch {}
 }
 
+function managementQuotasUrl(baseUrl: string): string {
+  const base = new URL(baseUrl);
+  base.pathname = `${base.pathname.replace(/\/+$/, "")}/`;
+  return new URL("../v0/management/quotas", base).toString();
+}
+
 async function doRefresh(): Promise<void> {
   try {
     config = loadConfig();
-    const response = await fetch(`${config.baseUrl}/v0/management/quotas`, {
+    const baseUrl = currentCtx?.modelRegistry.getProvider(PLEXUS_PROVIDER)?.baseUrl;
+    if (!baseUrl) throw new Error("Plexus provider has no base URL");
+
+    const response = await fetch(managementQuotasUrl(baseUrl), {
       headers: { "x-admin-key": config.adminKey },
       signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    const payload = (await response.json()) as QuotaChecker[];
+    const payload = await response.json();
+    if (!Array.isArray(payload)) throw new Error("Invalid quota response");
     lastLine = lineFromPayload(payload);
     renderWidget();
   } catch {
-    lastLine = config.checkers.map((checker) => `${checker.label ?? checker.checkerId}: ?`).join(" | ");
+    lastLine = "plexus quotas: ?";
     renderWidget();
   }
 }
@@ -234,6 +203,7 @@ async function refresh(): Promise<void> {
 
 function startPolling(): void {
   if (timer) clearInterval(timer);
+  config = loadConfig();
   void refresh();
   timer = setInterval(() => void refresh(), config.pollMs ?? 60_000);
   timer.unref?.();

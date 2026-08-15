@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "main": "index.ts",
+  "scripts": {
+    "test": "bun test.ts"
+  },
   "keywords": ["pi", "extension", "plexus", "quotas"],
   "pi": {
     "extensions": ["./index.ts"]
